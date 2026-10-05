@@ -1,24 +1,20 @@
 # The Gem
 
-https://github.com/Team-La-Groka
-
 Architecture by Team La Groka.
 
-[![Org](https://img.shields.io/badge/org-Team%20La%20Groka-111111)](https://github.com/Team-La-Groka)
+[![Org](https://img.shields.io/badge/org-lagroka-111111)](https://github.com/lagroka)
 [![Repo](https://img.shields.io/badge/repo-The%20Gem-111111)](https://github.com/VincentLaRocca/The-Gem)
 [![License](https://img.shields.io/badge/license-TBD-lightgrey)](LICENSE)
 
 A design is not a program. A program that has lost its design cannot be reviewed. The Gem separates the two.
 
-**Team:** Team La Groka · **Org:** [github.com/Team-La-Groka](https://github.com/Team-La-Groka) · **Placeholder:** [github.com/VincentLaRocca/The-Gem](https://github.com/VincentLaRocca/The-Gem)
+**Team:** Team La Groka · **Slug:** `lagroka` · **Placeholder:** [github.com/VincentLaRocca/The-Gem](https://github.com/VincentLaRocca/The-Gem)
 
 ## Clone
 
 ```bash
 git clone https://github.com/VincentLaRocca/The-Gem.git
 ```
-
-The organization exists. This tree has not moved. The signature on this commit cannot create a repository under `Team-La-Groka` until it has admin there.
 
 ## Abstract
 
@@ -53,27 +49,21 @@ History is append-only in spirit. Rewrites of the design are new sections, not s
 
 ## 4. Invariants
 
-These are the invariants of The Gem as published. They bind the repository, not a product that has not been specified.
-
-- **INV-1.** The organization is Team La Groka. The slug is `Team-La-Groka`. The earlier slug `lagroka` is rejected.
-- **INV-2.** The repository is The Gem. The intended clone path is `https://github.com/Team-La-Groka/The-Gem.git`. Until the transfer, the live path is `https://github.com/VincentLaRocca/The-Gem.git`.
+- **INV-1.** The organization is Team La Groka. The slug is `lagroka`. Display name and slug are different fields.
+- **INV-2.** The repository is The Gem. The intended clone path is `https://github.com/lagroka/The-Gem.git`. Until that org exists, the live path is `https://github.com/VincentLaRocca/The-Gem.git`.
 - **INV-3.** The anchor does not implement. The programmer does not rebrand.
 - **INV-4.** Display name and path are different fields. Collapsing them is an error.
 - **INV-5.** What is not written in this repository is not part of the architecture.
-
-Further invariants are added by the anchor, in order, when the design grows. They are not implied.
 
 ## 5. Boundaries
 
 ```text
 Team La Groka
-└── Team-La-Groka/The-Gem
+└── lagroka/The-Gem
     ├── README.md        anchor record (this file)
     ├── docs/decisions/  rejected alternatives, one file each
     └── src/             programmer surface, cited back to INV-n
 ```
-
-`README.md` is the root of trust. `docs/decisions/` explains why an invariant is shaped as it is. `src/` may be empty. An empty tree is a valid state. A tree that contradicts the README is not.
 
 ## 6. Admission
 
@@ -82,7 +72,7 @@ A change is admitted when all of the following hold.
 1. It names the role that authored it.
 2. If it is code, it cites one or more `INV-n` entries that already exist.
 3. If it adds or retires an invariant, the anchor wrote it, and the previous wording remains visible in history.
-4. The clone path in this file still names `Team-La-Groka/The-Gem` as the intended path.
+4. The clone path in this file still names `lagroka/The-Gem` as the intended path.
 
 There is no vote. There is a check. The check is readable by anyone who can read the diff.
 
@@ -94,27 +84,27 @@ The Gem is not a chain, a token, or a consensus protocol. The Satoshi form is us
 
 We have proposed a repository in which the design cannot be outrun by the patch. Team La Groka publishes it. The anchor keeps the invariants. The programmer implements them. The Gem is the record.
 
-## 9. Publication
+## 9. Rebrand
 
-The organization is formed. The slug is `Team-La-Groka`, not `lagroka`. That earlier name is rejected.
+`Team-La-Groka` was a mistaken slug. It is rejected.
 
-- Org: https://github.com/Team-La-Groka
-- Invite: https://github.com/organizations/Team-La-Groka/invite
+The name is Team La Groka. The slug is `lagroka`. Renaming the existing organization is an owner act in GitHub settings. This signature cannot rename an organization, and it does not have admin on `Team-La-Groka`.
+
+- Mistaken org, still live: https://github.com/Team-La-Groka
+- Intended org, not yet formed: https://github.com/lagroka
 - Live placeholder: https://github.com/VincentLaRocca/The-Gem
-
-Creating `Team-La-Groka/The-Gem` returned 403. This signature does not have admin on the organization. The invite cannot be accepted from here. Transfer waits on admin.
 
 ## Status
 
 | | |
 |---|---|
 | Team | Team La Groka |
-| GitHub org | `Team-La-Groka` |
-| Org URL | https://github.com/Team-La-Groka |
+| Slug | `lagroka` |
+| Rejected slug | `Team-La-Groka` |
 | Signing account | `VincentLaRocca` |
 | Repository | The Gem |
 | Live clone path | `https://github.com/VincentLaRocca/The-Gem.git` |
-| Intended clone path | `https://github.com/Team-La-Groka/The-Gem.git` |
+| Intended clone path | `https://github.com/lagroka/The-Gem.git` |
 | Anchor | Design record in this file |
 | Programmer | Gemini |
-| State | Org formed. Placeholder not yet transferred. Admin required. |
+| State | Rebrand recorded. Org rename not yet performed. |
