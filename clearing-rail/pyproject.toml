@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clearing-rail"
+version = "0.1.0"
+description = "Edge-Native Clearing Rail — brokerless mutual-credit reference implementation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+dependencies = []
+
+[project.optional-dependencies]
+crypto = ["cryptography>=41"]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["clearing_rail*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
