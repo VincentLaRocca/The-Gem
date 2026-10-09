@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-from .events import StakeReleased
+from .events import StakeClawedBack, StakeReleased
 from .ledger import Ledger
 from .types import CreditLimitExceeded, D, ValidationError, VouchEdge
 
@@ -33,6 +33,14 @@ class VouchGraph:
         a = self.ledger.node(voucher)
         self.ledger.node(vouchee)
         delta = a.credit_ceiling * self.policy.slice_fraction
+        lim = getattr(self.ledger, "limits", None)
+        if lim is not None:
+            # STARTER CAP: a new voucher stakes only a slice of what it has earned, and no
+            # vouch may put more stake behind a vouchee than the vouchee has earned.
+            if lim.is_new(voucher):
+                delta = min(delta, lim.effective_limit(voucher, ts) * self.policy.slice_fraction)
+            if lim.is_new(vouchee):
+                delta = min(delta, lim.effective_limit(vouchee, ts))
         if a.locked_vouch_stake + delta > a.credit_ceiling:
             raise CreditLimitExceeded(f"{voucher}: not enough unlocked ceiling for ΔC={delta}")
         if a.current_balance < -(a.available_credit - delta):
@@ -78,7 +86,8 @@ class VouchGraph:
         return seen
 
     def release(self, edge: VouchEdge, amount, ts: datetime, *, via_outside_volume: bool,
-                counterparty: Optional[str] = None, reason: str = "") -> Decimal:
+                counterparty: Optional[str] = None, reason: str = "",
+                backing: Tuple[Tuple[int, Decimal], ...] = (), release_id: Optional[int] = None) -> Decimal:
         amount = D(amount)
         if amount <= 0:
             raise ValidationError("release amount must be > 0")
@@ -87,6 +96,25 @@ class VouchGraph:
         edge.released += amount
         self.ledger.node(edge.voucher).locked_vouch_stake -= amount
         self.ledger.events.append(
-            StakeReleased(ts, edge.voucher, edge.vouchee, amount, via_outside_volume, counterparty, reason)
+            StakeReleased(ts, edge.voucher, edge.vouchee, amount, via_outside_volume, counterparty, reason,
+                          tuple(backing), release_id)
         )
+        return amount
+
+    def relock(self, edge: VouchEdge, amount, ts: datetime, *, release_id: Optional[int] = None,
+               reason: str = "") -> Decimal:
+        """FIX (S1 clawback): re-lock a previously released amount on ``edge``.
+
+        The voucher's available credit shrinks again. If the voucher already spent
+        the freed credit, its balance may now sit below the new floor; the ledger
+        then refuses further debit legs until it is back inside the floor (no
+        forced transfer is made)."""
+        amount = D(amount)
+        if amount <= 0:
+            raise ValidationError("relock amount must be > 0")
+        if amount > edge.released:
+            raise ValidationError(f"relock {amount} exceeds released {edge.released}")
+        edge.released -= amount
+        self.ledger.node(edge.voucher).locked_vouch_stake += amount
+        self.ledger.events.append(StakeClawedBack(ts, edge.voucher, edge.vouchee, amount, release_id, reason))
         return amount

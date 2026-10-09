@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 from .types import ZERO, D, ValidationError
 
@@ -63,6 +63,11 @@ def generate_payload(ctx: JobContext) -> List[PayloadKind]:
 
 
 # ------------------------------------------------------------------ rate card
+# FIX (S6, approved): no offer below this fraction of the claim's face is ever
+# ACCEPTed, even when floor_price < 0 (a zero offer on a negative floor is still
+# a WRITE_OFF, as before).
+MIN_RECOVERY_RATIO = Decimal("0.10")
+
 class SettlementDecision(str, Enum):
     ACCEPT = "ACCEPT"
     REJECT = "REJECT"
@@ -90,31 +95,85 @@ def alpha(days_outstanding: int) -> Decimal:
     return min(a, Decimal("1.0"))
 
 
-def evaluate_settlement(face_value, fixed_filing_cost, days_outstanding: int, cash_offer) -> RateCardResult:
+def evaluate_settlement(face_value, fixed_filing_cost, days_outstanding: int, cash_offer,
+                        *, exposure=None) -> RateCardResult:
     """Utility Settlement Accept Test.
 
-    floor_price = face_value * α(t) - fixed_filing_cost.
-    * cash_offer > 0 AND cash_offer >= max(0, floor_price)  -> ACCEPT
+    exposure (FIX S6) = the debtor's total face owed to this creditor, including
+    this claim (defaults to ``face_value``: a single claim). The filing cost is
+    paid once per exposure, so this claim's floor is its pro-rata share of the
+    aggregate floor:
+
+        floor_price = face_value * α(t) - fixed_filing_cost * face_value / exposure
+        min_recovery = MIN_RECOVERY_RATIO * face_value
+
+    * floor_price >= 0: ACCEPT iff cash_offer > 0 and cash_offer >= max(floor_price, min_recovery)
     * floor_price < 0:
-        - cash_offer > 0  -> ACCEPT (recovered = offer; remainder written off)
-        - otherwise       -> WRITE_OFF the whole balance
+        - cash_offer >= min_recovery (and > 0) -> ACCEPT (remainder written off)
+        - cash_offer == 0                      -> WRITE_OFF the whole balance
+        - otherwise                            -> REJECT
     * cash_offer == 0 is NEVER booked as recovered.
-    * otherwise REJECT (recovered = 0, written_off = 0).
     """
     face = D(face_value)
     cost = D(fixed_filing_cost)
     offer = D(cash_offer)
     if face < 0 or cost < 0 or offer < 0:
         raise ValidationError("face_value, fixed_filing_cost, cash_offer must be >= 0")
+    exp = face if exposure is None else D(exposure)
+    if exp < face:
+        raise ValidationError("exposure must be >= face_value")
     a = alpha(days_outstanding)
-    floor = face * a - cost
+    cost_share = cost if exp == face else (cost * face / exp if exp > 0 else ZERO)
+    floor = face * a - cost_share
+    min_recovery = MIN_RECOVERY_RATIO * face
 
     if floor < 0:
-        if offer > 0:
-            return RateCardResult(SettlementDecision.ACCEPT, a, floor, offer, face - offer, offer, face)
-        return RateCardResult(SettlementDecision.WRITE_OFF, a, floor, ZERO, face, offer, face)
+        if offer > 0 and offer >= min_recovery:
+            return RateCardResult(SettlementDecision.ACCEPT, a, floor, offer, max(ZERO, face - offer), offer, face)
+        if offer == 0:
+            return RateCardResult(SettlementDecision.WRITE_OFF, a, floor, ZERO, face, offer, face)
+        return RateCardResult(SettlementDecision.REJECT, a, floor, ZERO, ZERO, offer, face)
 
-    required = max(ZERO, floor)  # == floor when floor >= 0
+    required = max(floor, min_recovery)
     if offer > 0 and offer >= required:
         return RateCardResult(SettlementDecision.ACCEPT, a, floor, offer, max(ZERO, face - offer), offer, face)
     return RateCardResult(SettlementDecision.REJECT, a, floor, ZERO, ZERO, offer, face)
+
+
+class ClaimBook:
+    """FIX (S6): aggregates every claim a debtor owes one creditor, so splitting a
+    debt into many small claims cannot push each piece's floor below zero.
+
+    Exposure for a (debtor, creditor) pair = total face of every claim ever
+    registered for that pair in this book (open or closed), so settling pieces
+    one by one does not shrink the basis either."""
+
+    def __init__(self):
+        self._claims: Dict[int, Tuple[str, str, Decimal]] = {}
+        self._closed: Dict[int, SettlementDecision] = {}
+        self._next = 1
+
+    def add_claim(self, debtor: str, creditor: str, face_value) -> int:
+        face = D(face_value)
+        if face <= 0:
+            raise ValidationError("claim face must be > 0")
+        if debtor == creditor:
+            raise ValidationError("self-claim")
+        cid = self._next
+        self._next += 1
+        self._claims[cid] = (debtor, creditor, face)
+        return cid
+
+    def exposure(self, debtor: str, creditor: str) -> Decimal:
+        return sum((f for d, c, f in self._claims.values() if (d, c) == (debtor, creditor)), ZERO)
+
+    def evaluate(self, claim_id: int, fixed_filing_cost, days_outstanding: int, cash_offer) -> RateCardResult:
+        if claim_id not in self._claims:
+            raise ValidationError(f"unknown claim {claim_id}")
+        if claim_id in self._closed:
+            raise ValidationError(f"claim {claim_id} already {self._closed[claim_id].value}")
+        d, c, face = self._claims[claim_id]
+        r = evaluate_settlement(face, fixed_filing_cost, days_outstanding, cash_offer, exposure=self.exposure(d, c))
+        if r.decision is not SettlementDecision.REJECT:
+            self._closed[claim_id] = r.decision
+        return r

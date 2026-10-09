@@ -61,6 +61,23 @@ class Transfer:
 
 
 class Ledger:
+    def __setstate__(self, state):
+        """v2: restore a Ledger pickled by the pre-v2 package (e.g. the pilot's
+        state file). Fields added since then get their empty defaults; the
+        per-node transfer index is rebuilt. Old history has no repayment log."""
+        self.__dict__.update(state)
+        self.__dict__.setdefault("_reservations", {})
+        self.__dict__.setdefault("limits", None)
+        self.__dict__.setdefault("approvals", None)
+        self.__dict__.setdefault("_repayments", [])
+        self.__dict__.setdefault("_repay_by_node", {})
+        self.__dict__.setdefault("_repay_to", {})
+        if "_by_node" not in self.__dict__:
+            self._by_node = {}
+            for t in self._transfers:
+                self._by_node.setdefault(t.payer, []).append(t)
+                self._by_node.setdefault(t.payee, []).append(t)
+
     def __init__(self, events: Optional[EventLog] = None):
         self.nodes: Dict[str, Node] = {}
         self.events = events if events is not None else EventLog()
@@ -69,6 +86,17 @@ class Ledger:
         self._retries: Dict[str, int] = {}
         self._next_lot = 1
         self._next_transfer = 1
+        # FIX (S4): signed-hop reservations, res_id -> ((debtor, creditor), amount).
+        # Deliberately outside snapshot/restore, like solver bonds.
+        self._reservations: Dict[str, Tuple[Tuple[str, str], Decimal]] = {}
+        # STARTER CAP: optional earned-limit book (clearing_rail.limits.CreditLimits
+        # attaches itself here) and the log of debt actually repaid (cleared).
+        self.limits = None
+        self.approvals = None          # TIERED APPROVAL: clearing_rail.approvals.ApprovalBook
+        self._by_node: Dict[str, List[Transfer]] = {}   # per-node transfer index (perf only)
+        self._repayments: List = []
+        self._repay_by_node: Dict[str, List] = {}
+        self._repay_to: Dict[str, List] = {}          # V2: index by counterparty
 
     # ------------------------------------------------------------------ nodes
     def add_node(self, node: Node) -> Node:
@@ -108,14 +136,29 @@ class Ledger:
             raise CreditLimitExceeded(
                 f"{debtor}: balance {d.current_balance} - {amount} < floor {d.credit_floor}"
             )
-        # bilateral netting against any obligation creditor already owes debtor
-        remaining = amount
+        if self.limits is not None and self.limits.is_new(debtor):
+            floor = self.limits.spendable_floor(debtor, ts)
+            if d.current_balance - amount < floor:
+                raise CreditLimitExceeded(
+                    f"{debtor}: balance {d.current_balance} - {amount} < earned-limit floor {floor} (starter cap)"
+                )
+        if self.approvals is not None:
+            # TIERED APPROVAL (+ risk escalation): large or suspect exposure needs a live grant
+            self.approvals.check_credit(debtor, d.current_balance - amount, ts)
+        # bilateral netting against any obligation creditor already owes debtor.
+        # FIX (S4): never net into the reserved part of that obligation (a signed
+        # cycle hop); the excess opens a reverse lot instead.
+        nettable = max(ZERO, self.outstanding(creditor, debtor) - self.reserved(creditor, debtor))
+        to_net = min(amount, nettable)
         for lot in self._lots.get((creditor, debtor), []):
-            if remaining == 0:
+            if to_net == 0:
                 break
-            take = min(lot.amount, remaining)
+            take = min(lot.amount, to_net)
             lot.amount -= take
-            remaining -= take
+            to_net -= take
+            if take > 0:   # STARTER CAP: the seller (creditor) repaid its debt to the buyer
+                self._log_repayment(creditor, debtor, take, ts, "netting", lot.originated_at)
+        remaining = amount - min(amount, nettable)
         self._prune((creditor, debtor))
         if remaining > 0:
             self._lots.setdefault((debtor, creditor), []).append(
@@ -127,12 +170,54 @@ class Ledger:
         t = Transfer(self._next_transfer, debtor, creditor, amount, ts)
         self._next_transfer += 1
         self._transfers.append(t)
+        self._by_node.setdefault(debtor, []).append(t)
+        self._by_node.setdefault(creditor, []).append(t)
         self.events.append(TradeConfirmed(ts, t.transfer_id, debtor, creditor, amount, initiated_by))
         return t
 
     # ------------------------------------------------------------------ obligations
     def outstanding(self, debtor: str, creditor: str) -> Decimal:
         return sum((l.amount for l in self._lots.get((debtor, creditor), [])), ZERO)
+
+    # ------------------------------------------------------------------ reservations (FIX S4)
+    def reserved(self, debtor: str, creditor: str) -> Decimal:
+        return sum((amt for key, amt in self._reservations.values() if key == (debtor, creditor)), ZERO)
+
+    def reserve(self, res_id: str, debtor: str, creditor: str, amount) -> None:
+        """Reserve ``amount`` of obligation debtor->creditor so later trades cannot net it away."""
+        amount = D(amount)
+        if amount <= 0:
+            raise LedgerError("reservation must be > 0")
+        if res_id in self._reservations:
+            raise LedgerError(f"reservation {res_id} already exists")
+        free = self.outstanding(debtor, creditor) - self.reserved(debtor, creditor)
+        if free < amount:
+            raise LedgerError(f"obligation {debtor}->{creditor} has only {free} unreserved, cannot reserve {amount}")
+        self._reservations[res_id] = ((debtor, creditor), amount)
+
+    def release_reservation(self, res_id: str) -> None:
+        self._reservations.pop(res_id, None)
+
+    def net_pair(self, a: str, b: str, ts: Optional[datetime] = None) -> Decimal:
+        """V2 (invariant fix): net opposite-direction obligations between a and b that a
+        reservation kept apart. Only the unreserved parts net (oldest lots first). Net
+        balances do not change (both sides shrink by the same amount); each side's
+        reduction is logged as a repayment. Returns the amount netted."""
+        x = min(self.outstanding(a, b) - self.reserved(a, b), self.outstanding(b, a) - self.reserved(b, a))
+        if x <= 0:
+            return ZERO
+        for key in ((a, b), (b, a)):
+            left = x
+            for lot in sorted(self._lots.get(key, []), key=lambda l: (l.originated_at, l.lot_id)):
+                if left == 0:
+                    break
+                take = min(lot.amount, left)
+                lot.amount -= take
+                left -= take
+                if take > 0:
+                    self._log_repayment(key[0], key[1], take, ts, "netting", lot.originated_at)
+            self._prune(key)
+        return x
 
     def debit_lots(self, node_id: str) -> List[Lot]:
         out = [l for (d, _), lots in self._lots.items() if d == node_id for l in lots]
@@ -142,7 +227,31 @@ class Ledger:
         """Sum of the node's debit lots whose age is strictly greater than ``threshold``."""
         return sum((l.amount for l in self.debit_lots(node_id) if l.age(as_of) > threshold), ZERO)
 
-    def clear_leg(self, hop: Hop) -> None:
+    # ------------------------------------------------------------------ repayments (STARTER CAP)
+    def _log_repayment(self, repayer: str, counterparty: str, amount: Decimal, ts, via: str,
+                       opened_at: Optional[datetime] = None) -> None:
+        from .limits import Repayment
+        if self.limits is None or ts is None:
+            est, sea = True, False
+        else:
+            est, sea = self.limits.standing(counterparty, ts)
+        r = Repayment(repayer, counterparty, amount, ts, via, est, sea, opened_at)
+        self._repayments.append(r)
+        self._repay_by_node.setdefault(repayer, []).append(r)
+        self._repay_to.setdefault(counterparty, []).append(r)
+        if self.limits is not None and ts is not None:
+            self.limits._note_repayment_ts(ts)
+
+    def repayments_to(self, node_id: str) -> List:
+        """V2: repayments whose counterparty is ``node_id``."""
+        return list(self._repay_to.get(node_id, ()))
+
+    def repayments(self, node_id: Optional[str] = None) -> List:
+        if node_id is None:
+            return list(self._repayments)
+        return list(self._repay_by_node.get(node_id, ()))
+
+    def clear_leg(self, hop: Hop, ts: Optional[datetime] = None) -> None:
         """Reduce obligation ``hop.debtor -> hop.creditor`` by ``hop.amount`` (oldest lot first)."""
         if hop.amount <= 0:
             raise LedgerError("clearing amount must be > 0")
@@ -158,13 +267,15 @@ class Ledger:
             take = min(lot.amount, remaining)
             lot.amount -= take
             remaining -= take
+            if take > 0:
+                self._log_repayment(hop.debtor, hop.creditor, take, ts, "cycle", lot.originated_at)
         self._prune(key)
         self.node(hop.debtor).current_balance += hop.amount
         self.node(hop.creditor).current_balance -= hop.amount
 
-    def apply_cycle(self, hops: Iterable[Hop]) -> None:
+    def apply_cycle(self, hops: Iterable[Hop], ts: Optional[datetime] = None) -> None:
         for h in hops:
-            self.clear_leg(h)
+            self.clear_leg(h, ts)
 
     def age_balance(self, node_id: str, penalty: timedelta = timedelta(0)) -> int:
         """Keep the node's balance aging (its clock is NOT reset), apply an
@@ -193,6 +304,10 @@ class Ledger:
             if {t.payer, t.payee} == {a, b} and start < t.ts <= end
         ]
 
+    def transfers_of(self, node: str, start: datetime, end: datetime) -> List[Transfer]:
+        """FIX (S1): every transfer where ``node`` is payer or payee, start < ts <= end."""
+        return [t for t in self._by_node.get(node, ()) if start < t.ts <= end]
+
     def bilateral_volume(self, a: str, b: str, as_of: datetime,
                          window: timedelta = ROLLING_WINDOW) -> Tuple[Decimal, Decimal]:
         """(outbound a->b, inbound b->a) over the rolling window ending at ``as_of``."""
@@ -215,14 +330,27 @@ class Ledger:
             dict(self._retries),
             self._next_lot,
             self._next_transfer,
+            len(self._repayments),
         )
 
     def restore(self, snap) -> None:
-        balances, lots, n_transfers, retries, next_lot, next_transfer = snap
+        balances, lots, n_transfers, retries, next_lot, next_transfer, n_repay = snap
+        if len(self._repayments) > n_repay:
+            del self._repayments[n_repay:]
+            self._repay_by_node = {}
+            self._repay_to = {}
+            for r in self._repayments:
+                self._repay_by_node.setdefault(r.repayer, []).append(r)
+                self._repay_to.setdefault(r.counterparty, []).append(r)
+            if self.limits is not None:
+                self.limits._invalidate()
         for k, bal in balances.items():
             self.nodes[k].current_balance = bal
         self._lots = copy.deepcopy(lots)
         del self._transfers[n_transfers:]
+        keep = {t.transfer_id for t in self._transfers}
+        for k in list(self._by_node):
+            self._by_node[k] = [t for t in self._by_node[k] if t.transfer_id in keep]
         self._retries = dict(retries)
         self._next_lot, self._next_transfer = next_lot, next_transfer
 

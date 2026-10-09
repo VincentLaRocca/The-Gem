@@ -16,7 +16,7 @@ from clearing_rail.types import CreditLimitExceeded, Node, ValidationError
 from clearing_rail.vouch import VouchGraph, VouchPolicy
 from conftest import T0
 
-AS_OF = T0 + timedelta(days=40)
+AS_OF = T0 + timedelta(days=60)   # FIX-ADJUST: was 40; day-20 legs must be >= 30 d old (matured)
 
 
 def setup(depth=1, unlock_ratio=Decimal("1.0")):
@@ -139,30 +139,35 @@ def test_same_window_volume_cannot_amortize_twice():
     assert again.status is S.NO_NET_TRANSFER and again.unlocked == 0
     later = AS_OF + timedelta(days=1)
     l.record_trade("B", "C", Decimal("10"), later)
-    assert eng.amortize("A", "B", "C", later).unlocked == Decimal("10")
+    # FIX-ADJUST: was amortize(..., later); a leg now unlocks only once matured (30 d)
+    assert eng.amortize("A", "B", "C", later + timedelta(days=30)).unlocked == Decimal("10")
     assert edge.released == Decimal("50")
 
 
 def test_wash_filter_uses_full_window_including_consumed_volume():
+    # FIX-ADJUST: same trade timeline; amortize calls moved 30 d later (maturity) and
+    # the unlock on day 33 is now min(eligible 40, aggregate net 110) = 40 -> 4.0
+    # (was the pair-only fresh net 10 -> 1.0).
     l, _, _, eng = setup(unlock_ratio=Decimal("0.1"))
     d = lambda n: T0 + timedelta(days=n)
     l.record_trade("B", "C", Decimal("100"), d(1))
-    assert eng.amortize("A", "B", "C", d(1)).unlocked == Decimal("10.0")
+    assert eng.amortize("A", "B", "C", d(31)).unlocked == Decimal("10.0")
     l.record_trade("C", "B", Decimal("30"), d(2))
-    assert eng.amortize("A", "B", "C", d(2)).status is S.NO_NET_TRANSFER
+    assert eng.amortize("A", "B", "C", d(32)).status is S.NO_NET_TRANSFER
     l.record_trade("B", "C", Decimal("40"), d(3))
-    r = eng.amortize("A", "B", "C", d(3))          # fresh net 40-30 = 10
-    assert r.status is S.UNLOCKED and r.unlocked == Decimal("1.0")
-    # day-1 outbound rolls out of the window; consumed inbound 30 does not
+    r = eng.amortize("A", "B", "C", d(33))
+    assert r.status is S.UNLOCKED and r.unlocked == Decimal("4.0")
+    # day-1 outbound rolls out of the span; consumed day-3 outbound and inbound 30 do not
     l.record_trade("B", "C", Decimal("10"), d(31))
-    r = eng.amortize("A", "B", "C", d(31) + timedelta(hours=12))
-    # fresh slice alone (out 10 / in 0) would pass; full window (out 50 / in 30) is a wash
+    r = eng.amortize("A", "B", "C", d(61) + timedelta(hours=12))
+    # eligible slice alone (out 10 / in 0) would pass; span (out 50 / in 30) is a wash
     assert r.status is S.WASH_DISQUALIFIED and r.unlocked == 0
 
 
 def test_volume_outside_30_day_window_ignored():
     l, _, _, eng = setup()
-    l.record_trade("B", "C", Decimal("40"), AS_OF - timedelta(days=31))
+    # FIX-ADJUST: was 31 d; matured legs are eligible for (as_of - 60 d, as_of - 30 d]
+    l.record_trade("B", "C", Decimal("40"), AS_OF - timedelta(days=61))
     assert eng.amortize("A", "B", "C", AS_OF).status is S.NO_NET_TRANSFER
 
 

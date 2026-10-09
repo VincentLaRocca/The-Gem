@@ -24,6 +24,11 @@ from .ledger import Ledger
 from .types import ZERO, Clock, CycleCandidate, D, Hop, LedgerError, ValidationError
 
 
+# FIX (hardening): smallest bond a solver may register with or keep operating on.
+# A slash that leaves the bond below this deregisters the solver.
+MIN_SOLVER_BOND = Decimal("100")
+
+
 # ------------------------------------------------------------------ structural rules
 def validate_cycle_structure(candidate: CycleCandidate) -> None:
     hops = candidate.hops
@@ -124,7 +129,7 @@ class SolverAccount:
 
     @property
     def active(self) -> bool:
-        return self.bond > 0
+        return self.bond >= MIN_SOLVER_BOND
 
 
 # ------------------------------------------------------------------ registries
@@ -137,8 +142,8 @@ class SolverRegistry:
 
     def register(self, solver_id: str, bond, public_key: bytes) -> SolverAccount:
         bond = D(bond)
-        if bond <= 0:
-            raise ValidationError("solver bond must be > 0")
+        if bond < MIN_SOLVER_BOND:
+            raise ValidationError(f"solver bond must be >= MIN_SOLVER_BOND ({MIN_SOLVER_BOND})")
         if solver_id in self._accounts:
             raise ValidationError(f"solver {solver_id} already registered")
         self.keys.register(solver_id, public_key)
@@ -229,7 +234,7 @@ class SettlementEngine:
         matches = sub.settlement_vector.matches(block.published_vector)
         try:
             with self.ledger.transaction():
-                self.ledger.apply_cycle(sub.legs)
+                self.ledger.apply_cycle(sub.legs, now)
                 if not matches:
                     raise _VectorMismatch()
         except _VectorMismatch:

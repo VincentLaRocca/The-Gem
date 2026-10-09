@@ -40,7 +40,8 @@ def test_end_to_end_telemetry():
     g = VouchGraph(L)
     edge = g.vouch("Q", "V", now)
     L.record_trade("V", "C", Decimal("60"), now)
-    assert AmortizationEngine(L, g).amortize("Q", "V", "C", now).unlocked == Decimal("60")
+    # FIX-ADJUST: was as_of=now; the V->C leg must be matured (30 d) before it backs an unlock
+    assert AmortizationEngine(L, g).amortize("Q", "V", "C", now + timedelta(days=30)).unlocked == Decimal("60")
     g.release(edge, Decimal("20"), now, via_outside_volume=False, reason="governance")
     # clearing: A is a stale target, settles intact
     cand = triangle("c1", "S1", "100")

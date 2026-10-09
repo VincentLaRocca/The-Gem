@@ -11,7 +11,10 @@ the clearing core.
 * **Where:** `clearing_rail.solver.SolverCommittee` Protocol.
 * **What core does:** validates a published `CycleCandidate`, drives the
   signature windows, and on a router timeout hands a `ResidualGraph` to
-  `committee.request_rerun(...)`.
+  `committee.request_rerun(...)`. With several late routers, it excludes the one
+  whose debit leg is earliest in the signed hop order (deterministic, independent
+  of `PYTHONHASHSEED`). Nodes barred for repeated router misses (v2 S4 fix) are
+  refused by `propose`; a committee should leave them out of new candidates.
 * **What core does NOT do:** find cycles. There is no matching engine, no
   graph search, no ILP / heuristic solver. Tests ship a trivial double that
   records the residual and optionally returns a pre-seeded candidate.
@@ -107,3 +110,36 @@ the clearing core.
   `ResidualGraph`, and uses them for telemetry.
 * **What core does NOT do:** verify that a rerun candidate actually excludes
   the dropped node or descends from the named parent.
+
+## 12. Member admission (who is GENESIS vs NEW) — starter cap
+
+* **Where:** `CreditLimits.register(node_id, joined_at, genesis=...)`.
+* **What core does:** applies the starter cap and earned growth to NEW members;
+  genesis and unregistered nodes keep their configured ceiling.
+* **What core does NOT do:** decide who is a founding member, price identity, or
+  stop one person from registering many NEW identities. Each identity is capped at
+  `STARTER_LIMIT`, so a sybil army of k identities can still take k x 250.
+* **V2:** anchors (whose repayment earns full credit) are GENESIS / unregistered
+  members only. Other NEW members are *peers*; credit from a peer is limited by a
+  budget of 0.33 x that peer's own repayment to anchors (see `limits.py`).
+
+## 13. Tiered approval signers and panel selection
+
+* **Where:** `ApprovalBook.open/sign/decline/tick`, `approval_message`.
+* **What core does:** size tier + risk bump, k-of-n quorum, signer timeout / miss
+  counter / bar, grants, reject cool-down. Signatures go through the same
+  `Verifier`/`KeyRegistry` interface as #2 (HMAC double in tests).
+* **What core does NOT do:** real Bitcoin multisig or any key aggregation;
+  committee-grade panel selection (sha256 order of a counter is a stand-in);
+  or the human judgement of whether to approve. The Monte Carlo battery models
+  that judgement with an explicit stub rule.
+* **V2:** OFF by default. `ApprovalBook(..., policy=ApprovalPolicy())` never gates;
+  pass `ApprovalPolicy(tiers=True, escalation=True)` to switch it on.
+
+## 14. Admission bond (EXPERIMENT, off by default)
+
+* **Where:** `clearing_rail/admission.py` (`AdmissionBonds`, `BondPolicy`).
+* **What core does:** keeps a book of bonds (held / refunded / forfeited) and the
+  forfeit (default, wash) and refund (180 d tenure, 2x starter limit, no stale debt) rules.
+* **What core does NOT do:** collect, escrow, or pay out the deposit (cash, sats).
+  That is STUB-DEPENDENT. Nothing in the package posts a bond unless a caller does.

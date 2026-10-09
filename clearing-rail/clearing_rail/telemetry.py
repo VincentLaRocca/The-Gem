@@ -11,12 +11,13 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Iterable, Optional
+from typing import Dict, Iterable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from .events import (
     Event,
     EventLog,
+    StakeClawedBack,
     StakeReleased,
     TargetDebitClearedIntact,
     TargetDebitIdentified,
@@ -48,15 +49,37 @@ def extraction_autonomy(events: Iterable[Event]) -> Optional[Decimal]:
 
 
 def true_vouch_integrity(events: Iterable[Event]) -> Optional[Decimal]:
-    """Stake released via non-netting outside volume / total stake released."""
-    outside = ZERO
+    """Matured-volume-backed release / total stake released.  (FIX: new definition)
+
+    numerator   = min(V, R_out)
+      R_out = outside-volume releases that were NOT later clawed back
+      V     = distinct matured transfers backing those releases, each counted ONCE
+              (so one small trade backing many vouchers' releases counts once)
+    denominator = every StakeReleased amount (outside or not, clawed back or not)
+
+    A hand-built outside release with no ``backing`` (legacy events) is treated as
+    backed by its own amount. Ratio is None when nothing was released."""
+    events = list(events)
+    clawed_ids = {e.release_id for e in events if isinstance(e, StakeClawedBack) and e.release_id is not None}
+    clawed_anon = sum((e.amount for e in events if isinstance(e, StakeClawedBack) and e.release_id is None), ZERO)
     total = ZERO
-    for e in events:
-        if isinstance(e, StakeReleased):
-            total += e.amount
-            if e.via_outside_volume:
-                outside += e.amount
-    return _ratio(outside, total)
+    r_out = ZERO
+    backing: Dict[object, Decimal] = {}
+    for i, e in enumerate(events):
+        if not isinstance(e, StakeReleased):
+            continue
+        total += e.amount
+        if not e.via_outside_volume or (e.release_id is not None and e.release_id in clawed_ids):
+            continue
+        r_out += e.amount
+        if e.backing:
+            for tid, amt in e.backing:
+                backing[("t", tid)] = amt
+        else:
+            backing[("legacy", i)] = e.amount
+    r_out = max(ZERO, r_out - clawed_anon)
+    v = sum(backing.values(), ZERO)
+    return _ratio(min(v, r_out), total)
 
 
 def distress_discipline(events: Iterable[Event]) -> Optional[Decimal]:

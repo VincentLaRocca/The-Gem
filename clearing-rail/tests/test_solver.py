@@ -285,3 +285,24 @@ def test_settle_reverts_when_block_never_published(world):
     exe = world.loop.settle("unpub")
     assert exe.state is X.REVERTED
     assert exe.commit_result.status is CommitStatus.REJECTED_NO_PUBLISHED_BLOCK
+
+
+def test_router_timeout_drops_earliest_hop_late_router_not_alphabetical(world):
+    """Determinism fix: with two late routers, drop the one whose debit leg comes first
+    in the signed hop order (here Z at hop 1), not the alphabetically-first one (C)."""
+    world.add_nodes("A", "Z", "C")
+    world.add_solver("S1")
+    now = world.clock.now()
+    world.ledger.record_trade("A", "Z", Decimal("400"), now - STALE)
+    world.ledger.record_trade("Z", "C", Decimal("100"), now)
+    world.ledger.record_trade("C", "A", Decimal("100"), now)
+    cand = triangle("c1", "S1", "100", nodes=("A", "Z", "C"))
+    world.publish(cand)
+    exe = start(world, cand)
+    assert exe.target_ids == {"A"} and exe.router_ids == {"Z", "C"}
+    sign(world, cand, "A")
+    world.clock.advance(timedelta(hours=2, seconds=1))
+    assert world.loop.tick("c1").state is X.RERUN_REQUESTED
+    (req,) = world.committee.requests
+    assert req.excluded == {"Z"}
+    assert [e.node_id for e in world.ledger.events.of_type(RouterDropped)] == ["Z"]

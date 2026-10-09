@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Iterable, Iterator, List, Optional, Type, TypeVar
+from typing import Iterable, Iterator, List, Optional, Tuple, Type, TypeVar
 
 from .types import Initiator
 
@@ -33,6 +33,31 @@ class StakeReleased(Event):
     via_outside_volume: bool
     counterparty: Optional[str] = None
     reason: str = ""
+    # FIX (telemetry): matured outbound transfers that backed this release, as
+    # (transfer_id, amount) pairs, and the engine's release id (for clawbacks).
+    backing: Tuple[Tuple[int, Decimal], ...] = ()
+    release_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class StakeClawedBack(Event):
+    """FIX (S1): a released amount re-locked because a later check found a wash."""
+
+    voucher: str
+    vouchee: str
+    amount: Decimal
+    release_id: Optional[int] = None
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class RepeatWithholderFlagged(Event):
+    """FIX (S4): a router reached ROUTER_MISS_THRESHOLD signature misses (across lineages)."""
+
+    candidate_id: str
+    node_id: str
+    misses: int
+    barred_until: datetime
 
 
 @dataclass(frozen=True)

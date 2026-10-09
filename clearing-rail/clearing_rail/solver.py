@@ -29,6 +29,7 @@ from typing import Dict, FrozenSet, List, Optional, Protocol, Set, Tuple
 
 from .events import (
     ExecutionTransition,
+    RepeatWithholderFlagged,
     RouterDropped,
     TargetDebitClearedIntact,
     TargetDebitIdentified,
@@ -47,6 +48,7 @@ from .settlement import (
 )
 from .types import (
     ZERO,
+    LedgerError,
     Clock,
     CycleCandidate,
     Hop,
@@ -61,6 +63,12 @@ ROUTER_WINDOW = timedelta(hours=2)
 TARGET_WINDOW = timedelta(hours=12)
 FLOOR_RATIO = Decimal("0.25")
 AGE_PENALTY = timedelta(0)   # stub; see INTERFACES.md
+# FIX (S4): a router that misses its signature window this many times (counted per
+# node across all candidates/lineages) is aged via Ledger.age_balance (the same
+# mechanic as a dropped target) and barred from new candidates for ROUTER_MISS_BAR
+# after its latest miss. The first miss is free (could be an honest outage).
+ROUTER_MISS_THRESHOLD = 2
+ROUTER_MISS_BAR = timedelta(days=30)
 
 
 class ExecutionState(str, Enum):
@@ -169,6 +177,8 @@ def evaluate_targets(
         if stale <= 0:
             continue
         prior = node.urgency_boosts_used
+        if prior < 0:   # FIX (S5 hardening): also caught post-construction mutation
+            raise ValidationError(f"{node.node_id}: urgency_boosts_used must be >= 0")
         ok = prior == 0
         flags.append(TargetFlagEvaluated(as_of, candidate.candidate_id, node.node_id, stale, prior, ok))
         if ok:
@@ -190,6 +200,12 @@ def check_floor(targets: Tuple[CompressionTarget, ...], candidate: CycleCandidat
 
 # ------------------------------------------------------------------ engine
 class ClearingLoop:
+    def __setstate__(self, state):
+        """v2: accept a ClearingLoop pickled by the pre-v2 package (no miss counters)."""
+        self.__dict__.update(state)
+        self.__dict__.setdefault("_router_misses", {})
+        self.__dict__.setdefault("_last_miss", {})
+
     def __init__(
         self,
         ledger: Ledger,
@@ -208,6 +224,31 @@ class ClearingLoop:
         self.stale_threshold = stale_threshold
         self.age_penalty = age_penalty
         self._executions: Dict[str, Execution] = {}
+        self._router_misses: Dict[str, int] = {}
+        self._last_miss: Dict[str, datetime] = {}
+
+    def router_misses(self, node_id: str) -> int:
+        return self._router_misses.get(node_id, 0)
+
+    def barred_until(self, node_id: str) -> Optional[datetime]:
+        """End of the node's repeat-withholder bar, or None if it is not barred."""
+        if self._router_misses.get(node_id, 0) < ROUTER_MISS_THRESHOLD:
+            return None
+        return self._last_miss[node_id] + ROUTER_MISS_BAR
+
+    def _res_id(self, candidate_id: str, node_id: str) -> str:
+        return f"{candidate_id}\x00{node_id}"
+
+    def _release_reservations(self, exe: "Execution") -> None:
+        for n in exe.candidate.nodes:
+            self.ledger.release_reservation(self._res_id(exe.candidate_id, n))
+
+    def _renet(self, exe: "Execution") -> None:
+        """V2: once a candidate's reservations are gone, net any opposite obligations
+        they had kept apart, so the ledger never keeps both directions outstanding."""
+        now = self.clock.now()
+        for h in exe.candidate.hops:
+            self.ledger.net_pair(h.debtor, h.creditor, now)
 
     def get(self, candidate_id: str) -> Execution:
         return self._executions[candidate_id]
@@ -232,6 +273,9 @@ class ClearingLoop:
         validate_cycle_structure(candidate)
         for n in candidate.nodes:
             self.ledger.node(n)  # must exist
+            until = self.barred_until(n)
+            if until is not None and now < until:
+                raise ValidationError(f"{n} is barred as a repeat withholder until {until.isoformat()}")
         exe = Execution(candidate, ExecutionState.PROPOSED, now)
         self._executions[candidate.candidate_id] = exe
         return exe
@@ -288,6 +332,13 @@ class ClearingLoop:
         key = self.settlement.node_keys.get(node_id)
         if key is None or not self.settlement.verifier.verify(key, hop_message(chash, idx, hop), signature):
             raise SignatureError(f"bad signature from {node_id}")
+        if node_id not in exe.signatures:
+            # FIX (S4): reserve the signed hop until commit/timeout so a later trade
+            # cannot net it away and force a no-slash REVERTED_LEDGER.
+            try:
+                self.ledger.reserve(self._res_id(candidate_id, node_id), hop.debtor, hop.creditor, hop.amount)
+            except LedgerError as e:
+                raise ValidationError(f"{node_id} cannot sign: {e}") from None
         exe.signatures[node_id] = bytes(signature)
         if exe.signed >= set(exe.candidate.nodes):
             self._go(exe, ExecutionState.SIGNED)
@@ -303,11 +354,19 @@ class ClearingLoop:
         late_routers = [n for n in exe.router_ids if n not in exe.signed and now > exe.opened_at + ROUTER_WINDOW]
         # target rule wins if both miss
         if late_targets:
+            self._release_reservations(exe)
+            self._renet(exe)
             self._go(exe, ExecutionState.TARGET_TIMEOUT, f"late targets: {sorted(late_targets)}")
             return self._drop_cycle_and_age(exe, late_targets)
         if late_routers:
+            self._release_reservations(exe)
+            self._renet(exe)
+            self._count_router_misses(exe, sorted(late_routers))
             self._go(exe, ExecutionState.ROUTER_TIMEOUT, f"late routers: {sorted(late_routers)}")
-            return self._drop_node_and_rerun(exe, late_routers[0])
+            # determinism: drop the late router whose debit leg comes EARLIEST in the cycle
+            # (hop order is part of the signed candidate; no dependence on set/hash order)
+            order = {n: i for i, n in enumerate(exe.candidate.nodes)}
+            return self._drop_node_and_rerun(exe, min(late_routers, key=lambda n: (order[n], n)))
         return exe
 
     def settle(self, candidate_id: str, submitter_id: Optional[str] = None) -> Execution:
@@ -320,8 +379,10 @@ class ClearingLoop:
             legs=exe.candidate.hops,
             signatures=tuple(exe.signatures[h.debtor] for h in exe.candidate.hops),
         )
+        self._release_reservations(exe)   # the commit itself consumes the reserved hops
         result = self.settlement.commit(sub)
         exe.commit_result = result
+        self._renet(exe)
         if result.status is CommitStatus.COMMITTED:
             self._go(exe, ExecutionState.SETTLED)
             # "intact" = settled in a single cycle, never dropped/rerun
@@ -341,10 +402,22 @@ class ClearingLoop:
         exe = self.get(candidate_id)
         if ExecutionState.REVERTED not in _TRANSITIONS.get(exe.state, set()):
             raise IllegalTransition(f"force_revert from {exe.state.value}")
+        self._release_reservations(exe)
+        self._renet(exe)
         self._go(exe, ExecutionState.REVERTED, reason)
         return exe
 
     # ---- private outcomes ---------------------------------------------------
+    def _count_router_misses(self, exe: Execution, late_routers: List[str]) -> None:
+        now = self.clock.now()
+        for n in late_routers:
+            self._router_misses[n] = self._router_misses.get(n, 0) + 1
+            self._last_miss[n] = now
+            if self._router_misses[n] >= ROUTER_MISS_THRESHOLD:
+                self.ledger.age_balance(n, self.age_penalty)
+                self.ledger.events.append(RepeatWithholderFlagged(
+                    now, exe.candidate_id, n, self._router_misses[n], now + ROUTER_MISS_BAR))
+
     def _drop_cycle_and_age(self, exe: Execution, late_targets: List[str]) -> Execution:
         for n in late_targets:
             retry = self.ledger.age_balance(n, self.age_penalty)

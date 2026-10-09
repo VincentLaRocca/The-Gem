@@ -23,6 +23,9 @@ clearing_rail/
   solver.py         CompressionTarget rules + execution state machine
   legal.py          Payload decision tree + rate card
   telemetry.py      Four kill-criteria ratios + GET /telemetry handler
+  limits.py         Starter cap + earned credit growth for NEW members (v2)
+  approvals.py      Tiered k-of-n approval + risk escalation (OFF by default)
+  admission.py      Admission bond book (EXPERIMENT, OFF by default)
 tests/              Full constraint coverage (stdlib + pytest)
 ```
 
@@ -38,6 +41,62 @@ tests/              Full constraint coverage (stdlib + pytest)
 * **Slash survives rollback.** Solver bonds live in `SolverRegistry`,
   deliberately outside the ledger, so a mismatch reverts ledger state *and*
   keeps the slash.
+
+## v2 hardening (local branch content; see `/workspace/mc-satoshi/*.md` for evidence)
+
+All of the following were tested on Monte Carlo batteries: 2000 trials per attack scenario,
+plus a 50-seed honest-traffic harness. Reports: `mc-satoshi/fixes.md`, `starter-cap.md`,
+`starter-cap-v2.md`.
+
+* **S1: wash rings vs amortization** (`amortization.py`).
+  * C2 and C3 use the vouchee's aggregate flows.
+  * Only legs at least 30 days old (`MATURITY_PERIOD`) back an unlock.
+  * Releases stay provisional for 60 days (`CLAWBACK_HORIZON`). A later wash re-locks them
+    (`StakeClawedBack`, `AmortizationEngine.recheck`).
+  * `true_vouch_integrity` counts each backing transfer once and excludes
+    clawed-back releases.
+* **S4: signature-window withholding** (`ledger.py`, `solver.py`).
+  * A signed hop is reserved, so later trades cannot net it away.
+  * Router misses are counted per node across lineages. At 2 misses
+    (`ROUTER_MISS_THRESHOLD`) the node is aged and barred for 30 days (`ROUTER_MISS_BAR`).
+* **S6: legal floor** (`legal.py`).
+  * `ClaimBook` gives each claim a pro-rata share of the fixed cost
+    across the debtor and creditor's total exposure.
+  * Offers below 10% of face (`MIN_RECOVERY_RATIO`) are never accepted.
+* **Hardening.**
+  * `MIN_SOLVER_BOND` (100).
+  * `Node` rejects bad `urgency_boosts_used`.
+* **Router-timeout determinism.** When several routers are late, the rerun drops the
+  late router whose debit leg comes **earliest in the signed hop order**. Before, the
+  choice depended on frozenset/hash order (`late_routers[0]`), so results changed with
+  `PYTHONHASHSEED`. The full suite runs identically under seeds 0 and 1.
+* **Invariant fix: `Ledger.net_pair`.**
+  * Once a candidate's reservations are released (settle, timeout, `force_revert`),
+    the unreserved parts of any opposite-direction obligations they kept apart are netted.
+  * Net balances do not change.
+  * This removes the "both directions outstanding" state that S4 reservations could leave behind.
+* **Starter cap v2** (`limits.py`, `CreditLimits`; opt-in: only nodes registered as
+  NEW are capped).
+  * A NEW member starts at 250. It grows per 30-day period, once the period is 30 days old,
+    at a rate of 0.5 × credited repayment. Growth is capped at 50% per period and at 25% of
+    the limit per counterparty.
+  * Repayment to GENESIS or unregistered members counts in full.
+  * Repayment to other members 60 days or older and not wash-flagged counts only out
+    of a budget of 0.33 × that member's own repayment to GENESIS or unregistered members.
+    This keeps honest work per credit of growth at 1.5 or more, even for sybil rings.
+  * Members who grew to 1000 are peers, not anchors.
+  * Repaid lots younger than 1 day earn nothing.
+  * Growth freezes only if debt older than 90 days exceeds 0.5 × the limit.
+  * `StarterPolicy.v1()` reproduces the earlier rule.
+* **Approvals OFF by default** (`approvals.py`). `ApprovalBook(..., policy=ApprovalPolicy())` never
+  gates. `ApprovalPolicy(tiers=True, escalation=True)` turns on 2-of-3 approval above 1000
+  and 3-of-5 above 5000, plus risk-score tier bumps. **STUB-DEPENDENT:** signatures use the
+  `Verifier` interface. This is not Bitcoin multisig.
+* **Admission bond EXPERIMENT, OFF by default** (`admission.py`).
+  * Nothing posts a bond unless a caller constructs `AdmissionBonds`.
+  * Collecting and paying out the deposit is a stub.
+  * Measured result: it removes one-and-done profit but not patient-attacker profit, and it
+    locks honest capital. Kept off.
 
 ## Interpretations (spec gaps — overrule freely)
 
@@ -57,7 +116,8 @@ code comments where it applies.
    `true_vouch_integrity`).
 3. **Available credit** = `credit_ceiling - locked_vouch_stake`. A debit leg
    may not push a node's balance below `-(available credit)`. This is an
-   **assumption** not stated in the original spec.
+   **assumption** not stated in the original spec. For a NEW member registered
+   with `CreditLimits`, the floor is `-min(available credit, earned limit)`.
 4. **CompressionTarget / distress_discipline contradiction.** The original
    text requires `urgency_boosts_used == 0` to *be* a CompressionTarget,
    which would make `distress_discipline` always 0 by construction.
@@ -72,7 +132,8 @@ code comments where it applies.
 6. **Execution SM states**: `PROPOSED → VALIDATED → AWAITING_SIGNATURES →
    (SIGNED → SETTLED) | (ROUTER_TIMEOUT → RERUN_REQUESTED) |
    (TARGET_TIMEOUT → DROPPED) | REVERTED`. If a target and a router both
-   miss, the **target rule wins**. `drop_node_and_rerun` excludes the node
+   miss, the **target rule wins**. With several late routers, the one whose
+   debit leg is earliest in hop order is dropped (deterministic). `drop_node_and_rerun` excludes the node
    and hands a `ResidualGraph` to `SolverCommittee` — core never searches
    for a replacement. A trivial test-double committee lives in `tests/`.
 7. **Settlement**: submitter must be the registered solver that published the
@@ -185,12 +246,14 @@ search, cryptographic key issuance/rotation, on-chain smart-contract target
 rendering / jurisdiction rules data, notice-clock source, the age-penalty
 policy for dropped targets, where slashed bonds go, what an urgency boost
 does, the edge-agent offer protocol, and production telemetry transport.
+Since v2, the list also includes member admission (who is GENESIS), approval
+signers and panel selection, and admission-bond custody.
 
 ## Run the tests
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install pytest cryptography
-.venv/bin/pytest -q
+PYTHONHASHSEED=0 .venv/bin/pytest -q    # 186 tests; also run with PYTHONHASHSEED=1
 ```
 
 Stdlib only is enough for the core; `cryptography` is optional and used by

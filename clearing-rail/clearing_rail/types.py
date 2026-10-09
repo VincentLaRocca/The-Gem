@@ -119,6 +119,12 @@ class Node:
             raise ValidationError("credit_ceiling must be >= 0")
         if self.locked_vouch_stake < 0 or self.locked_vouch_stake > self.credit_ceiling:
             raise ValidationError("locked_vouch_stake must be within [0, credit_ceiling]")
+        if isinstance(self.urgency_boosts_used, bool) or not isinstance(self.urgency_boosts_used, int):
+            raise ValidationError("urgency_boosts_used must be an int")
+        if self.urgency_boosts_used < 0:
+            # FIX (S5 hardening): a negative count would dodge target treatment AND
+            # the distress_discipline ratio (which only counts prior_boosts > 0).
+            raise ValidationError("urgency_boosts_used must be >= 0")
 
     @property
     def available_credit(self) -> Decimal:

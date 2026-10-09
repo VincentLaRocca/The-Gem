@@ -66,15 +66,19 @@ def test_zero_offer_never_recovered_when_floor_positive():
 def test_floor_exactly_zero():
     # 100 * 0.70 - 70 = 0
     assert evaluate_settlement(Decimal(100), Decimal(70), 0, Decimal(0)).decision is S.REJECT
-    r = evaluate_settlement(Decimal(100), Decimal(70), 0, Decimal("0.01"))
-    assert r.decision is S.ACCEPT and r.recovered == Decimal("0.01")
+    # FIX-ADJUST: 0.01 was ACCEPTed; MIN_RECOVERY_RATIO (10% of face) now applies
+    assert evaluate_settlement(Decimal(100), Decimal(70), 0, Decimal("0.01")).decision is S.REJECT
+    r = evaluate_settlement(Decimal(100), Decimal(70), 0, Decimal("10"))
+    assert r.decision is S.ACCEPT and r.recovered == Decimal("10")
 
 
 def test_negative_floor_positive_offer_accepts_and_writes_off_rest():
     # floor = 100 * 0.70 - 500 = -430
+    # FIX-ADJUST: offer was 5 (ACCEPT); below MIN_RECOVERY_RATIO*face = 10 it is now REJECT
     r = evaluate_settlement(Decimal(100), Decimal(500), 10, Decimal(5))
-    assert r.floor_price == Decimal("-430.00")
-    assert (r.decision, r.recovered, r.written_off) == (S.ACCEPT, Decimal(5), Decimal(95))
+    assert r.floor_price == Decimal("-430.00") and r.decision is S.REJECT
+    r = evaluate_settlement(Decimal(100), Decimal(500), 10, Decimal(10))
+    assert (r.decision, r.recovered, r.written_off) == (S.ACCEPT, Decimal(10), Decimal(90))
 
 
 def test_negative_floor_zero_offer_writes_off_whole_balance_and_books_nothing():

@@ -18,6 +18,9 @@ from .types import (
 from .ledger import Ledger
 from .vouch import VouchGraph, VouchPolicy
 from .amortization import AmortizationEngine, AmortizationPolicy
+from .limits import CreditLimits, StarterPolicy
+from .approvals import ApprovalBook, ApprovalPolicy
+from .admission import AdmissionBonds, BondPolicy
 from .solver import ClearingLoop, ExecutionState, SolverCommittee
 from .settlement import (
     CandidateBoard,
@@ -33,7 +36,8 @@ __all__ = [
     "ZERO", "Clock", "ManualClock", "Node", "VouchEdge", "Hop", "CycleCandidate",
     "Initiator", "IllegalTransition",
     "Ledger", "VouchGraph", "VouchPolicy",
-    "AmortizationEngine", "AmortizationPolicy",
+    "AmortizationEngine", "AmortizationPolicy", "CreditLimits", "StarterPolicy", "ApprovalBook", "ApprovalPolicy",
+    "AdmissionBonds", "BondPolicy",
     "ClearingLoop", "ExecutionState", "SolverCommittee",
     "SolverRegistry", "CandidateBoard", "PublishedCandidateBlock",
     "SettlementEngine", "SettlementSubmission",
